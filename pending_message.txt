@@ -1,0 +1,1557 @@
+这个模块很有价值，而且不应只作为 WebSocket 的附属逻辑。更合理的定位是：
+
+> `pending_messages` 是位于 API、Agent 编排和事件存储之间的“可靠消息层”，负责消息持久化、顺序控制、确认、重试和断线补发。
+
+WebSocket 只承担实时传输，不能作为消息的唯一保存位置。
+
+# Pending Messages 模块设计与项目结构调整
+
+## 一、模块要解决的问题
+
+`pending_messages` 主要解决三类场景。
+
+### 1. 前端长连接断线
+
+WebSocket 连接断开后，Agent 仍可能持续产生：
+
+* 模型回复；
+* 工具调用事件；
+* 工具执行结果；
+* 任务状态变化；
+* 最终报告；
+* 错误信息。
+
+这些消息不能因为 WebSocket 断开而丢失。
+
+正确流程应为：
+
+```text
+Agent产生事件
+→ 先持久化
+→ 再尝试通过WebSocket发送
+→ 前端确认收到
+→ 标记为已送达
+```
+
+WebSocket 断开时，消息仍保存在服务端；前端重连后从上次确认位置继续补发。
+
+---
+
+### 2. 沙箱启动或唤醒延迟
+
+用户可能在沙箱尚未进入 `RUNNING` 状态时连续发送多条指令：
+
+```text
+消息1：分析仓库
+消息2：重点检查认证模块
+消息3：生成Markdown报告
+```
+
+如果直接执行，可能出现：
+
+* 消息1因为沙箱未启动而失败；
+* 消息2先于消息1执行；
+* 消息3找不到前置分析结果；
+* 重试后重复执行。
+
+因此，用户消息需要先进入持久化队列，等待：
+
+```text
+沙箱状态 = RUNNING
+并且前一条消息已经处理完成
+```
+
+之后再按顺序交给 Agent。
+
+---
+
+### 3. 前端离线期间的长任务
+
+任务可能执行数分钟甚至更久。用户关闭页面后，后台仍然会产生大量事件。
+
+系统不能要求：
+
+```text
+前端必须在线
+```
+
+而应该做到：
+
+```text
+前端在线
+→ 实时推送
+
+前端离线
+→ 持久化积压
+
+前端重新上线
+→ 按序补发遗漏事件
+```
+
+---
+
+# 二、核心交付语义
+
+网络环境下很难真正保证“严格只发送一次”。
+
+因此系统采用：
+
+```text
+至少一次投递
++
+消息幂等
++
+顺序编号
++
+客户端去重
+```
+
+也就是：
+
+* 消息可能因为重试被发送多次；
+* 但每条消息有唯一 `message_id`；
+* 前端和 Agent 消费端必须按 `message_id` 去重；
+* 每个会话有独立递增 `sequence`；
+* 前端按 `sequence` 恢复正确顺序。
+
+不应该宣称实现了绝对的 `exactly once`，更准确的表述是：
+
+> 通过至少一次投递、幂等键和会话序列号实现业务层面的有效一次处理。
+
+---
+
+# 三、模块在总体架构中的位置
+
+```text
+                 ┌────────────────────┐
+                 │   Web / Frontend   │
+                 └─────────┬──────────┘
+                           │ WebSocket / HTTP
+                           ↓
+                 ┌────────────────────┐
+                 │ Conversation API   │
+                 └─────────┬──────────┘
+                           ↓
+              ┌──────────────────────────┐
+              │ PendingMessageService    │
+              │ 持久化、排序、ACK、重试   │
+              └───────┬─────────┬────────┘
+                      │         │
+              入站消息│         │出站事件
+                      ↓         ↑
+              ┌───────────┐  ┌───────────┐
+              │ Dispatcher│  │EventStore │
+              └─────┬─────┘  └─────┬─────┘
+                    ↓              ↑
+              TaskOrchestrator → AgentRunner
+                    ↓              ↓
+              SandboxService   Tool Events
+```
+
+这里有两条消息路径：
+
+```text
+入站消息：
+前端 → Pending Messages → Agent
+
+出站消息：
+Agent / Task → Event Store → Pending Messages → 前端
+```
+
+---
+
+# 四、调整后的项目目录
+
+```text
+cloud-agent-platform/
+├── app/
+│   ├── main.py
+│   │
+│   ├── api/
+│   │   ├── task_api.py
+│   │   └── conversation_ws.py
+│   │
+│   ├── config/
+│   │   └── settings.py
+│   │
+│   ├── domain/
+│   │   ├── task.py
+│   │   ├── repository.py
+│   │   ├── conversation.py
+│   │   └── event.py
+│   │
+│   ├── orchestration/
+│   │   ├── task_orchestrator.py
+│   │   ├── agent_runner.py
+│   │   ├── task_state_machine.py
+│   │   └── context_manager.py
+│   │
+│   ├── pending_messages/
+│   │   ├── models.py
+│   │   ├── store.py
+│   │   ├── service.py
+│   │   ├── dispatcher.py
+│   │   ├── replay_service.py
+│   │   ├── retry_policy.py
+│   │   ├── ordering.py
+│   │   ├── worker.py
+│   │   └── errors.py
+│   │
+│   ├── workspace/
+│   │   ├── workspace_manager.py
+│   │   └── repository_preparer.py
+│   │
+│   ├── sandbox/
+│   │   ├── models.py
+│   │   ├── service.py
+│   │   └── providers/
+│   │       ├── docker.py
+│   │       ├── kubernetes.py
+│   │       └── firecracker.py
+│   │
+│   ├── llm/
+│   │   ├── models.py
+│   │   ├── provider.py
+│   │   ├── config.py
+│   │   ├── capabilities.py
+│   │   ├── registry.py
+│   │   ├── router.py
+│   │   ├── errors.py
+│   │   ├── adapters/
+│   │   │   ├── message_adapter.py
+│   │   │   └── tool_schema_adapter.py
+│   │   └── providers/
+│   │       ├── openai.py
+│   │       ├── anthropic.py
+│   │       ├── google.py
+│   │       ├── openai_compatible.py
+│   │       └── mock.py
+│   │
+│   ├── tools/
+│   │   ├── models.py
+│   │   ├── base.py
+│   │   ├── registry.py
+│   │   ├── policy.py
+│   │   ├── native/
+│   │   │   ├── file_tools.py
+│   │   │   ├── search_tools.py
+│   │   │   └── artifact_tools.py
+│   │   └── executors/
+│   │       ├── native_executor.py
+│   │       └── mcp_executor.py
+│   │
+│   ├── integrations/
+│   │   └── mcp/
+│   │       ├── models.py
+│   │       ├── config.py
+│   │       ├── client.py
+│   │       ├── manager.py
+│   │       ├── tool_adapter.py
+│   │       ├── auth.py
+│   │       └── errors.py
+│   │
+│   ├── verification/
+│   │   ├── models.py
+│   │   ├── verifier.py
+│   │   └── todo_report_verifier.py
+│   │
+│   └── storage/
+│       ├── task_store.py
+│       └── event_store.py
+│
+├── sandbox/
+│   └── Dockerfile
+│
+├── tests/
+│   ├── test_pending_message_store.py
+│   ├── test_pending_message_ordering.py
+│   ├── test_pending_message_replay.py
+│   ├── test_pending_message_retry.py
+│   └── test_websocket_reconnect.py
+│
+└── ...
+```
+
+---
+
+# 五、为什么单独建立 `pending_messages/`
+
+它不适合直接放在 `api/` 下，因为它不只是 WebSocket 处理逻辑。
+
+它也不适合全部放在 `storage/` 下，因为它不仅负责保存数据，还包含：
+
+* 消息状态机；
+* 顺序控制；
+* ACK；
+* 重试；
+* 消费租约；
+* 沙箱就绪判断；
+* 重连补发；
+* 死信处理。
+
+因此：
+
+```text
+storage
+负责“怎么保存”
+
+pending_messages
+负责“消息应该何时发送、如何重试、怎样确认”
+```
+
+`pending_messages/store.py` 可以使用 SQLite、PostgreSQL 或 Redis，但业务规则属于 `pending_messages` 模块。
+
+---
+
+# 六、领域层新增 `conversation.py`
+
+## `app/domain/conversation.py`
+
+### 作用
+
+描述一次持续对话，而不是单次任务。
+
+建议包含：
+
+```text
+Conversation
+ConversationStatus
+ConversationParticipant
+ConversationOffset
+```
+
+### `Conversation`
+
+主要字段：
+
+```text
+conversation_id
+task_id
+user_id
+sandbox_id
+status
+created_at
+updated_at
+```
+
+### `ConversationStatus`
+
+```text
+CREATED
+WAITING_FOR_SANDBOX
+ACTIVE
+PAUSED
+COMPLETED
+FAILED
+```
+
+### `ConversationOffset`
+
+记录会话消息消费位置：
+
+```text
+next_inbound_sequence
+next_outbound_sequence
+last_processed_inbound_sequence
+last_acked_outbound_sequence
+```
+
+其中：
+
+* `inbound`：前端发给 Agent；
+* `outbound`：Agent 发给前端。
+
+---
+
+# 七、Pending Messages 数据模型
+
+## `app/pending_messages/models.py`
+
+### 作用
+
+定义可靠消息队列的数据模型。
+
+建议定义：
+
+```text
+MessageDirection
+MessageStatus
+MessageType
+PendingMessage
+DeliveryAttempt
+AckRequest
+ReplayRequest
+```
+
+---
+
+## 1. `MessageDirection`
+
+```text
+INBOUND
+OUTBOUND
+```
+
+### INBOUND
+
+用户或前端发给 Agent 的消息。
+
+例如：
+
+```text
+继续分析认证模块
+停止当前任务
+生成最终报告
+```
+
+### OUTBOUND
+
+Agent 或任务系统发给前端的消息。
+
+例如：
+
+```text
+模型回复
+工具调用
+工具结果
+任务进度
+最终报告
+错误信息
+```
+
+---
+
+## 2. `MessageStatus`
+
+建议状态：
+
+```text
+PENDING
+WAITING_DEPENDENCY
+READY
+IN_FLIGHT
+ACKED
+RETRY_WAIT
+DEAD_LETTER
+CANCELLED
+EXPIRED
+```
+
+### `PENDING`
+
+消息刚写入持久化存储。
+
+### `WAITING_DEPENDENCY`
+
+消息暂时不能执行。
+
+典型原因：
+
+```text
+沙箱尚未启动
+前一条入站消息尚未处理
+任务处于暂停状态
+```
+
+### `READY`
+
+依赖条件已经满足，可以分发。
+
+### `IN_FLIGHT`
+
+已交给 Agent 或已发送到前端，但尚未确认成功。
+
+### `ACKED`
+
+消费者已确认收到或处理完成。
+
+### `RETRY_WAIT`
+
+本次分发失败，等待下一次重试时间。
+
+### `DEAD_LETTER`
+
+超过最大重试次数，需要人工检查或记录失败。
+
+### `CANCELLED`
+
+任务取消后，尚未执行的消息被取消。
+
+### `EXPIRED`
+
+消息超过有效期，不再继续发送。
+
+---
+
+## 3. `PendingMessage`
+
+建议包含：
+
+```text
+message_id
+conversation_id
+task_id
+direction
+message_type
+sequence
+idempotency_key
+payload
+status
+dependency
+attempt_count
+max_attempts
+available_at
+ack_deadline
+last_error
+created_at
+updated_at
+expires_at
+```
+
+### `message_id`
+
+服务端生成的唯一消息 ID。
+
+用于：
+
+* 服务端查询；
+* 前端去重；
+* 重试识别；
+* ACK。
+
+### `sequence`
+
+会话内递增序号。
+
+入站和出站建议分别编号：
+
+```text
+inbound_sequence
+outbound_sequence
+```
+
+不能使用时间戳代替序列号，因为并发写入时可能相同或顺序不稳定。
+
+### `idempotency_key`
+
+前端提交消息时生成的唯一键。
+
+例如用户点击发送后，因为网络超时重新提交同一消息，服务端可以通过该键识别重复请求。
+
+建议唯一约束：
+
+```text
+conversation_id + direction + idempotency_key
+```
+
+### `dependency`
+
+记录当前消息依赖什么条件：
+
+```text
+SANDBOX_RUNNING
+PREVIOUS_MESSAGE_ACKED
+TASK_RUNNING
+NONE
+```
+
+### `available_at`
+
+消息下一次允许尝试的时间。
+
+它支持延迟重试，而不是失败后立即无限循环。
+
+### `ack_deadline`
+
+消息进入 `IN_FLIGHT` 后，消费者必须在这个时间前确认。
+
+超过时间则重新进入重试流程。
+
+---
+
+# 八、各文件职责
+
+## 1. `pending_messages/store.py`
+
+### 作用
+
+定义消息持久化接口，并提供具体存储实现。
+
+建议接口：
+
+```text
+enqueue
+get
+claim_next
+mark_in_flight
+mark_acked
+mark_retry
+mark_dead_letter
+list_pending
+list_after_sequence
+release_expired_leases
+cancel_by_task
+```
+
+### `enqueue`
+
+将消息持久化，并分配会话序列号。
+
+### `claim_next`
+
+由 Worker 领取下一条可处理消息。
+
+领取时需要建立“租约”，避免多个 Worker 同时处理同一条消息。
+
+### `mark_acked`
+
+确认消息已送达或已执行。
+
+### `list_after_sequence`
+
+用于前端重连补发：
+
+```text
+查询 sequence > 前端最后确认序号的所有消息
+```
+
+### 第一版存储
+
+可以使用：
+
+```text
+SQLite
+```
+
+后期替换：
+
+```text
+PostgreSQL
+Redis Streams
+Kafka
+```
+
+---
+
+## 2. `pending_messages/service.py`
+
+### 作用
+
+Pending Messages 模块的主要业务入口。
+
+其他模块不应直接操作 Store，而应调用 Service。
+
+### 主要职责
+
+* 创建入站消息；
+* 创建出站消息；
+* 分配幂等键；
+* 检查重复消息；
+* 更新消息状态；
+* 处理 ACK；
+* 触发补发；
+* 取消任务消息；
+* 将 Agent 事件转换为待发送消息。
+
+### 主要方法概念
+
+```text
+enqueue_inbound
+enqueue_outbound
+acknowledge
+release_waiting_messages
+cancel_conversation
+get_replay_messages
+```
+
+---
+
+## 3. `pending_messages/dispatcher.py`
+
+### 作用
+
+判断一条消息应该交给谁执行。
+
+根据消息方向分为两条路径。
+
+### 入站消息
+
+```text
+PendingMessage
+→ 检查沙箱状态
+→ 检查前一条消息是否完成
+→ 交给AgentRunner
+```
+
+### 出站消息
+
+```text
+PendingMessage
+→ 检查WebSocket会话
+→ 在线则发送
+→ 离线则继续保留
+```
+
+Dispatcher 不负责长期循环，它只负责一次分发决策。
+
+---
+
+## 4. `pending_messages/replay_service.py`
+
+### 作用
+
+负责前端重连后的消息回放。
+
+前端重连时提交：
+
+```text
+conversation_id
+last_acked_sequence
+```
+
+ReplayService 查询：
+
+```text
+sequence > last_acked_sequence
+```
+
+然后按顺序补发。
+
+### 补发原则
+
+* 按 `sequence` 升序；
+* 每条消息带 `message_id`；
+* 可以分批返回；
+* 前端完成处理后发送累计 ACK；
+* 服务端更新最后确认位置。
+
+### 累计 ACK
+
+前端可以不逐条 ACK，而是发送：
+
+```text
+我已经连续收到并处理到 sequence = 128
+```
+
+服务端将：
+
+```text
+sequence <= 128
+```
+
+且属于该会话的消息标记为已确认。
+
+这比每条消息单独 ACK 更高效。
+
+---
+
+## 5. `pending_messages/retry_policy.py`
+
+### 作用
+
+统一计算消息是否应重试以及下一次重试时间。
+
+建议采用：
+
+```text
+指数退避
++
+随机抖动
+```
+
+例如：
+
+```text
+第1次：1秒
+第2次：2秒
+第3次：4秒
+第4次：8秒
+最大：30秒
+```
+
+加入随机抖动可以避免大量消息同时重新发送。
+
+### 不同失败应区别处理
+
+#### 可重试
+
+```text
+WebSocket暂时断开
+沙箱仍在启动
+MCP服务临时不可用
+AgentRunner短暂繁忙
+```
+
+#### 不可重试
+
+```text
+消息参数非法
+任务已取消
+权限被拒绝
+工具不存在
+会话不存在
+```
+
+不可重试消息直接进入失败或死信状态。
+
+---
+
+## 6. `pending_messages/ordering.py`
+
+### 作用
+
+保证单个会话内消息的逻辑顺序。
+
+### 入站顺序
+
+对于同一个会话：
+
+```text
+只有 sequence = last_processed + 1
+```
+
+的消息允许交给 Agent。
+
+后续消息必须等待前一条处理完成。
+
+### 出站顺序
+
+Agent 事件按生成顺序分配 `outbound_sequence`。
+
+发送时可以批量发送，但必须：
+
+* 按序读取；
+* 按序写入 WebSocket；
+* 前端按 sequence 排序和去重。
+
+### 不要求全局有序
+
+不同会话之间可以并发：
+
+```text
+Conversation A：1 → 2 → 3
+Conversation B：1 → 2 → 3
+```
+
+但不需要保证 A 和 B 之间的全局顺序。
+
+---
+
+## 7. `pending_messages/worker.py`
+
+### 作用
+
+后台循环领取并处理待发送消息。
+
+基本流程：
+
+```text
+查询到期且可处理的消息
+→ claim建立租约
+→ Dispatcher分发
+→ 成功则等待ACK或直接完成
+→ 失败则计算重试
+→ 超过次数则进入死信
+```
+
+### 还需要处理
+
+* Worker 崩溃后的租约恢复；
+* 超过 ACK Deadline 的消息；
+* 任务取消后的消息清理；
+* 沙箱状态变化后释放等待消息。
+
+### 第一版
+
+可以使用简单的 `asyncio` 后台任务定期轮询 SQLite。
+
+生产环境可以换成：
+
+```text
+Redis Streams
+RabbitMQ
+Kafka
+云消息队列
+```
+
+---
+
+## 8. `pending_messages/errors.py`
+
+### 作用
+
+统一模块异常。
+
+建议包含：
+
+```text
+PendingMessageError
+MessageNotFoundError
+DuplicateMessageError
+InvalidAckError
+MessageLeaseError
+OrderingViolationError
+RetryExhaustedError
+ConversationClosedError
+```
+
+---
+
+# 九、API 层新增 WebSocket 文件
+
+## `app/api/conversation_ws.py`
+
+### 作用
+
+管理前端和服务端的长连接。
+
+### 建立连接时
+
+前端发送：
+
+```text
+conversation_id
+last_acked_sequence
+client_session_id
+```
+
+服务端：
+
+1. 校验用户是否有权访问该会话；
+2. 注册当前 WebSocket Session；
+3. 调用 ReplayService；
+4. 补发断线期间遗漏消息；
+5. 继续实时发送新消息。
+
+### 收到用户消息时
+
+不能直接调用 AgentRunner。
+
+正确流程：
+
+```text
+WebSocket收到消息
+→ 生成或读取idempotency_key
+→ PendingMessageService.enqueue_inbound
+→ 返回消息已接收
+```
+
+之后由 Worker 按序交给 Agent。
+
+### 收到 ACK 时
+
+```text
+WebSocket ACK
+→ PendingMessageService.acknowledge
+→ 更新last_acked_outbound_sequence
+```
+
+### 断线时
+
+只注销连接，不删除消息。
+
+---
+
+# 十、与 EventStore 的关系
+
+`EventStore` 和 `PendingMessageStore` 不应合并。
+
+## EventStore
+
+记录不可变业务事实：
+
+```text
+模型发起请求
+模型返回响应
+工具开始执行
+工具执行完成
+任务状态改变
+```
+
+它用于：
+
+* 审计；
+* 调试；
+* 任务回放；
+* 统计。
+
+## PendingMessageStore
+
+记录消息当前投递状态：
+
+```text
+是否待发送
+是否正在发送
+是否已ACK
+重试了几次
+下次什么时候重试
+```
+
+它属于可变状态。
+
+推荐关系：
+
+```text
+Agent产生Event
+→ EventStore持久化事件
+→ 创建对应OUTBOUND PendingMessage
+→ WebSocket发送
+```
+
+PendingMessage 可以保存：
+
+```text
+event_id
+```
+
+引用原始事件，避免把所有业务数据重复存储多次。
+
+---
+
+# 十一、建议使用事务 Outbox 思想
+
+需要避免这种情况：
+
+```text
+EventStore保存成功
+→ 服务崩溃
+→ PendingMessage尚未创建
+→ 前端永远收不到事件
+```
+
+更可靠的方式是：
+
+```text
+同一个数据库事务中：
+1. 保存Event
+2. 保存Outbound PendingMessage
+3. 提交事务
+```
+
+这就是简化的 Transactional Outbox。
+
+第一版使用 SQLite 时，可以让 `EventStore` 和 `PendingMessageStore` 共用同一数据库事务。
+
+---
+
+# 十二、完整入站消息流程
+
+```text
+用户发送消息
+      ↓
+conversation_ws接收
+      ↓
+检查idempotency_key
+      ↓
+PendingMessageService持久化
+      ↓
+分配inbound_sequence
+      ↓
+状态=PENDING
+      ↓
+Worker领取
+      ↓
+Ordering检查前一条消息
+      ↓
+检查Sandbox状态
+```
+
+沙箱未运行：
+
+```text
+状态=WAITING_DEPENDENCY
+依赖=SANDBOX_RUNNING
+```
+
+沙箱运行：
+
+```text
+状态=READY
+→ Dispatcher
+→ AgentRunner
+→ 处理完成
+→ 标记ACKED
+→ 推进last_processed_inbound_sequence
+```
+
+随后下一条入站消息才可执行。
+
+---
+
+# 十三、沙箱启动延迟流程
+
+```text
+用户提交任务
+→ 创建沙箱
+→ 沙箱状态STARTING
+```
+
+此时用户继续发送消息：
+
+```text
+消息1 → WAITING_DEPENDENCY
+消息2 → WAITING_DEPENDENCY
+消息3 → WAITING_DEPENDENCY
+```
+
+沙箱启动完成后，TaskOrchestrator 产生：
+
+```text
+SANDBOX_RUNNING
+```
+
+PendingMessageService 接收状态变化：
+
+```text
+释放依赖为SANDBOX_RUNNING的消息
+→ sequence最小的消息变为READY
+→ Worker交给Agent
+```
+
+后续消息继续按序处理。
+
+---
+
+# 十四、完整出站消息流程
+
+```text
+Agent生成事件
+      ↓
+EventStore持久化
+      ↓
+创建OUTBOUND PendingMessage
+      ↓
+分配outbound_sequence
+      ↓
+Worker读取
+```
+
+前端在线：
+
+```text
+WebSocket发送
+→ 状态IN_FLIGHT
+→ 等待ACK
+→ 收到ACK
+→ 状态ACKED
+```
+
+前端离线：
+
+```text
+没有有效WebSocket
+→ 保持PENDING或RETRY_WAIT
+→ 前端重连
+→ ReplayService补发
+```
+
+ACK 超时：
+
+```text
+IN_FLIGHT超过ack_deadline
+→ RETRY_WAIT
+→ 重新发送
+```
+
+因此前端可能收到重复消息，必须通过：
+
+```text
+message_id
+```
+
+进行去重。
+
+---
+
+# 十五、前端重连协议
+
+前端应保存：
+
+```text
+conversation_id
+last_acked_sequence
+seen_message_ids
+```
+
+重连时发送：
+
+```text
+conversation_id
+last_acked_sequence
+```
+
+服务端返回：
+
+```text
+sequence > last_acked_sequence
+```
+
+的全部消息。
+
+推荐前端处理顺序：
+
+```text
+收到消息
+→ 检查message_id是否已存在
+→ 按sequence放入缓冲区
+→ 连续序列可用时渲染
+→ 更新last_acked_sequence
+→ 向服务端发送累计ACK
+```
+
+这样即使发生：
+
+* 重复；
+* 延迟；
+* 重连补发；
+* 短暂乱序；
+
+也可以还原正确对话。
+
+---
+
+# 十六、长任务离线流程
+
+```text
+用户启动任务
+→ 关闭页面
+→ WebSocket断开
+```
+
+后台继续：
+
+```text
+Agent推理
+→ 调用工具
+→ 产生进度事件
+→ 产生最终报告
+```
+
+所有事件：
+
+```text
+EventStore持久化
++
+PendingMessageStore记录待投递
+```
+
+用户重新打开页面：
+
+```text
+建立WebSocket
+→ 提交last_acked_sequence
+→ ReplayService返回遗漏消息
+→ 前端恢复完整对话
+```
+
+任务执行本身不依赖前端连接。
+
+---
+
+# 十七、消息状态转换
+
+## 入站消息
+
+```text
+PENDING
+   ↓
+WAITING_DEPENDENCY
+   ↓
+READY
+   ↓
+IN_FLIGHT
+   ↓
+ACKED
+```
+
+失败时：
+
+```text
+IN_FLIGHT
+   ↓
+RETRY_WAIT
+   ↓
+READY
+```
+
+超过重试次数：
+
+```text
+RETRY_WAIT
+   ↓
+DEAD_LETTER
+```
+
+---
+
+## 出站消息
+
+```text
+PENDING
+   ↓
+IN_FLIGHT
+   ↓
+ACKED
+```
+
+连接断开或 ACK 超时：
+
+```text
+IN_FLIGHT
+   ↓
+RETRY_WAIT
+   ↓
+PENDING
+```
+
+---
+
+# 十八、与现有模块的交互
+
+## TaskOrchestrator
+
+负责：
+
+* 创建 Conversation；
+* 启动沙箱；
+* 沙箱运行后释放等待消息；
+* 任务结束后处理尚未发送的最终消息；
+* 取消任务时取消入站消息。
+
+## AgentRunner
+
+不直接读取 WebSocket。
+
+它从 Dispatcher 接收已经排序并批准的入站消息。
+
+Agent 产生的回复通过：
+
+```text
+EventStore
++
+PendingMessageService.enqueue_outbound
+```
+
+发送给前端。
+
+## SandboxService
+
+提供沙箱状态：
+
+```text
+STARTING
+RUNNING
+PAUSED
+ERROR
+MISSING
+```
+
+Dispatcher 根据状态决定消息是否可以执行。
+
+## EventStore
+
+保存完整执行事件。
+
+## WebSocket API
+
+只处理：
+
+* 连接；
+* 接收；
+* ACK；
+* 实时发送；
+* 断线注销。
+
+不承担可靠性存储。
+
+---
+
+# 十九、第一版需要实现的范围
+
+笔试第一版不需要引入 Kafka 或 Redis。
+
+建议实现：
+
+```text
+pending_messages/models.py
+pending_messages/store.py
+pending_messages/service.py
+pending_messages/dispatcher.py
+pending_messages/replay_service.py
+pending_messages/retry_policy.py
+pending_messages/worker.py
+api/conversation_ws.py
+domain/conversation.py
+```
+
+技术方案：
+
+```text
+SQLite持久化
+asyncio后台Worker
+WebSocket长连接
+按conversation_id排序
+累计ACK
+指数退避重试
+message_id去重
+```
+
+`ordering.py` 的逻辑也可以暂时放进 `service.py`，后期再独立。
+
+---
+
+# 二十、第一版暂时不需要实现
+
+```text
+Kafka
+RabbitMQ
+Redis Cluster
+多机消息分区
+严格分布式锁
+跨区域复制
+复杂死信管理界面
+消息优先级调度
+全局顺序
+```
+
+这些可以放进未来扩展。
+
+---
+
+# 二十一、需要补充的测试
+
+## `test_pending_message_store.py`
+
+测试：
+
+* 消息持久化；
+* 序列号递增；
+* 幂等键去重；
+* 状态更新；
+* ACK。
+
+## `test_pending_message_ordering.py`
+
+测试：
+
+* 同一会话消息按序处理；
+* 前一条未完成时后一条不能执行；
+* 不同会话可以并发。
+
+## `test_pending_message_replay.py`
+
+测试：
+
+* 从指定 sequence 补发；
+* 补发顺序正确；
+* 已 ACK 消息不重复返回；
+* 分页回放。
+
+## `test_pending_message_retry.py`
+
+测试：
+
+* ACK 超时；
+* 指数退避；
+* 达到最大次数进入死信；
+* 不可重试错误直接失败。
+
+## `test_websocket_reconnect.py`
+
+测试：
+
+```text
+连接
+→ 接收消息1、2
+→ ACK到2
+→ 断线
+→ 后台产生3、4、5
+→ 重连并声明last_acked=2
+→ 收到3、4、5
+```
+
+---
+
+# 二十二、加入模块后的完整执行流程
+
+```text
+前端提交消息
+      ↓
+Conversation WebSocket API
+      ↓
+PendingMessageService
+      ↓
+持久化入站消息
+      ↓
+PendingMessageWorker
+      ↓
+检查顺序和依赖
+      ↓
+沙箱是否RUNNING
+      ├── 否 → 等待
+      └── 是 → AgentRunner
+                    ↓
+               ModelProvider
+                    ↓
+                 Tool Call
+                    ↓
+               Tool Executor
+                    ↓
+              Sandbox / MCP
+                    ↓
+                Agent Event
+                    ↓
+                 EventStore
+                    ↓
+          Outbound PendingMessage
+                    ↓
+          WebSocket在线？
+           ├── 是 → 发送并等待ACK
+           └── 否 → 持久化等待重连
+```
+
+---
+
+# 二十三、模块设计总结
+
+`pending_messages` 不是普通的内存队列，也不是 WebSocket 缓存。
+
+它是 Agent 对话系统中的可靠消息层，负责：
+
+```text
+持久化
+顺序控制
+幂等去重
+依赖等待
+发送确认
+失败重试
+断线补发
+离线回放
+死信处理
+```
+
+加入后，系统的职责边界变为：
+
+```text
+WebSocket
+负责实时连接
+
+Pending Messages
+负责可靠投递
+
+EventStore
+负责记录业务事实
+
+AgentRunner
+负责推理与工具循环
+
+SandboxService
+负责隔离执行
+
+TaskOrchestrator
+负责整个任务生命周期
+```
+
+最关键的设计原则是：
+
+> WebSocket 可以断，前端可以离线，沙箱可以延迟启动，但消息不能依赖任何一个短暂连接或运行状态而存在。消息必须先持久化，再分发；通过序列号、ACK、重试和幂等机制恢复完整、有序的 Agent 对话。

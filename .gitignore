@@ -1,0 +1,50 @@
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime data
+.local/
+workspaces/
+artifacts/
+logs/
+*.log
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Node/frontend dependencies, if a UI is added later
+node_modules/
+
+# Local editor and assistant state
+.vscode/
+.idea/
+.codex/
+.agents/
+
+# OS files
+.DS_Store
+Thumbs.db

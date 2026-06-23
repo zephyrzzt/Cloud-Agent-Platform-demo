@@ -1,0 +1,1824 @@
+# Cloud Agent Platform 新增 Event Callback 与 File Storage 后的整体设计
+
+## 一、新增模块的定位
+
+### 1. Event Callback
+
+`event_callback` 提供 Webhook 和 Callback 能力。
+
+当 OpenHands 风格的 Agent 会话中发生特定事件时，平台可以通知外部系统，例如：
+
+```text
+任务创建
+沙箱启动
+模型开始推理
+工具开始执行
+工具执行完成
+任务成功
+任务失败
+报告生成
+用户取消任务
+```
+
+外部系统可以是：
+
+```text
+企业业务系统
+CI/CD 平台
+监控系统
+GitHub App
+审批系统
+消息通知平台
+第三方自动化服务
+```
+
+它解决的是：
+
+> 平台内部发生事件后，如何可靠、安全、异步地通知外部系统。
+
+---
+
+### 2. File Storage
+
+`file_storage` 提供统一的文件存储接口。
+
+平台中的文件包括：
+
+```text
+Agent 生成的 Markdown 报告
+代码补丁
+执行日志
+测试报告
+截图
+上传文件
+压缩包
+模型生成的其他任务产物
+```
+
+这些文件不应由业务代码直接绑定本地磁盘。
+
+所有模块统一依赖：
+
+```text
+FileStore
+```
+
+然后根据运行环境替换实际后端：
+
+```text
+LocalFileStore
+InMemoryFileStore
+S3FileStore
+GoogleCloudStorageFileStore
+AzureBlobFileStore
+```
+
+它解决的是：
+
+> 业务层不需要知道文件最终存储在本地磁盘、内存还是云对象存储中。
+
+---
+
+# 二、三个消息与存储模块的区别
+
+## 1. Event Store
+
+记录系统中已经发生的业务事实。
+
+例如：
+
+```text
+工具调用已经开始
+沙箱已经进入RUNNING
+任务已经完成
+```
+
+特点：
+
+* 事件通常不可变；
+* 用于审计、调试和回放；
+* 记录“发生了什么”。
+
+---
+
+## 2. Pending Messages
+
+负责平台与前端之间的可靠消息投递。
+
+例如：
+
+```text
+模型回复
+工具调用进度
+任务状态
+最终结果
+```
+
+特点：
+
+* 有 ACK；
+* 有顺序号；
+* 支持前端断线补发；
+* 支持重试和离线回放；
+* 记录“这条消息是否送达前端”。
+
+---
+
+## 3. Event Callback
+
+负责把事件通知给外部系统。
+
+例如：
+
+```text
+任务完成后通知业务系统
+任务失败后触发告警Webhook
+报告生成后通知CI平台
+```
+
+特点：
+
+* 面向外部系统；
+* 通过 HTTP Webhook 或内部 Callback 投递；
+* 有签名、超时、重试和死信；
+* 记录“这个外部系统是否收到事件”。
+
+---
+
+## 4. File Storage
+
+负责保存文件内容。
+
+例如：
+
+```text
+report.md
+patch.diff
+execution.log
+test-result.json
+```
+
+特点：
+
+* 保存二进制或文本对象；
+* 不负责事件投递；
+* 不负责任务状态；
+* 返回统一的 `FileRef`；
+* 支持本地、内存和云存储切换。
+
+---
+
+# 三、调整后的总体架构
+
+```text
+┌──────────────────────────────────────────┐
+│          Frontend / CLI / API            │
+└───────────────────┬──────────────────────┘
+                    ↓
+┌──────────────────────────────────────────┐
+│    Conversation API / WebSocket Gateway  │
+└───────────────────┬──────────────────────┘
+                    ↓
+┌──────────────────────────────────────────┐
+│           Pending Messages Layer         │
+│ 持久化、排序、ACK、重试、断线补发         │
+└───────────────────┬──────────────────────┘
+                    ↓
+┌──────────────────────────────────────────┐
+│             Task Orchestrator            │
+│ 状态、工作空间、沙箱、Agent、验证、清理   │
+└───────┬─────────────┬─────────────┬──────┘
+        ↓             ↓             ↓
+   Workspace      AgentRunner     Verifier
+        ↓             ↓
+   Repository     ModelRouter
+   Preparer           ↓
+        ↓         ModelProvider
+   Sandbox            ↓
+   Service        Tool Call
+        ↑             ↓
+        └────── Tool Registry
+                       ↓
+                Tool Policy
+                 ┌─────┴─────┐
+                 ↓           ↓
+          NativeExecutor  MCPExecutor
+                 ↓           ↓
+          DockerSandbox   MCP Manager
+
+所有模块产生事件
+        ↓
+┌──────────────────────────────────────────┐
+│               Event Store                │
+└──────────────┬────────────────┬──────────┘
+               ↓                ↓
+     Pending Outbound       Event Callback
+        Messages                Service
+               ↓                ↓
+           Frontend         External Systems
+
+任务产物
+        ↓
+┌──────────────────────────────────────────┐
+│               File Store                 │
+│ Local / Memory / S3 / GCS / Azure Blob   │
+└──────────────────────────────────────────┘
+```
+
+---
+
+# 四、完整项目目录
+
+```text
+cloud-agent-platform/
+├── app/
+│   ├── main.py
+│   │
+│   ├── api/
+│   │   ├── task_api.py
+│   │   ├── conversation_ws.py
+│   │   ├── artifact_api.py
+│   │   └── callback_api.py
+│   │
+│   ├── config/
+│   │   └── settings.py
+│   │
+│   ├── domain/
+│   │   ├── task.py
+│   │   ├── repository.py
+│   │   ├── conversation.py
+│   │   └── event.py
+│   │
+│   ├── orchestration/
+│   │   ├── task_orchestrator.py
+│   │   ├── agent_runner.py
+│   │   ├── task_state_machine.py
+│   │   └── context_manager.py
+│   │
+│   ├── pending_messages/
+│   │   ├── models.py
+│   │   ├── store.py
+│   │   ├── service.py
+│   │   ├── dispatcher.py
+│   │   ├── replay_service.py
+│   │   ├── retry_policy.py
+│   │   ├── ordering.py
+│   │   ├── worker.py
+│   │   └── errors.py
+│   │
+│   ├── event_callback/
+│   │   ├── models.py
+│   │   ├── config.py
+│   │   ├── callback.py
+│   │   ├── registry.py
+│   │   ├── service.py
+│   │   ├── dispatcher.py
+│   │   ├── store.py
+│   │   ├── signing.py
+│   │   ├── retry_policy.py
+│   │   ├── worker.py
+│   │   ├── errors.py
+│   │   └── providers/
+│   │       ├── webhook.py
+│   │       ├── in_process.py
+│   │       └── message_queue.py
+│   │
+│   ├── file_storage/
+│   │   ├── models.py
+│   │   ├── config.py
+│   │   ├── base.py
+│   │   ├── registry.py
+│   │   ├── factory.py
+│   │   ├── path_policy.py
+│   │   ├── errors.py
+│   │   └── providers/
+│   │       ├── local.py
+│   │       ├── memory.py
+│   │       ├── s3.py
+│   │       ├── gcs.py
+│   │       └── azure_blob.py
+│   │
+│   ├── workspace/
+│   │   ├── workspace_manager.py
+│   │   └── repository_preparer.py
+│   │
+│   ├── sandbox/
+│   │   ├── models.py
+│   │   ├── service.py
+│   │   └── providers/
+│   │       ├── docker.py
+│   │       ├── kubernetes.py
+│   │       └── firecracker.py
+│   │
+│   ├── llm/
+│   │   ├── models.py
+│   │   ├── provider.py
+│   │   ├── config.py
+│   │   ├── capabilities.py
+│   │   ├── registry.py
+│   │   ├── router.py
+│   │   ├── errors.py
+│   │   ├── adapters/
+│   │   │   ├── message_adapter.py
+│   │   │   └── tool_schema_adapter.py
+│   │   └── providers/
+│   │       ├── openai.py
+│   │       ├── anthropic.py
+│   │       ├── google.py
+│   │       ├── openai_compatible.py
+│   │       └── mock.py
+│   │
+│   ├── tools/
+│   │   ├── models.py
+│   │   ├── base.py
+│   │   ├── registry.py
+│   │   ├── policy.py
+│   │   ├── native/
+│   │   │   ├── file_tools.py
+│   │   │   ├── search_tools.py
+│   │   │   └── artifact_tools.py
+│   │   └── executors/
+│   │       ├── native_executor.py
+│   │       └── mcp_executor.py
+│   │
+│   ├── integrations/
+│   │   └── mcp/
+│   │       ├── models.py
+│   │       ├── config.py
+│   │       ├── client.py
+│   │       ├── manager.py
+│   │       ├── tool_adapter.py
+│   │       ├── auth.py
+│   │       └── errors.py
+│   │
+│   ├── verification/
+│   │   ├── models.py
+│   │   ├── verifier.py
+│   │   └── todo_report_verifier.py
+│   │
+│   └── storage/
+│       ├── task_store.py
+│       └── event_store.py
+│
+├── sandbox/
+│   └── Dockerfile
+│
+├── docs/
+│   ├── architecture.md
+│   ├── execution-flow.md
+│   ├── messaging-design.md
+│   ├── callback-design.md
+│   ├── file-storage-design.md
+│   └── security-design.md
+│
+├── tests/
+│   ├── test_event_callback.py
+│   ├── test_webhook_retry.py
+│   ├── test_webhook_signing.py
+│   ├── test_local_file_store.py
+│   ├── test_memory_file_store.py
+│   ├── test_file_store_factory.py
+│   └── ...
+│
+├── demo.py
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+---
+
+# 五、Event Callback 模块
+
+## 1. `event_callback/models.py`
+
+定义回调系统的数据模型。
+
+建议包含：
+
+```text
+CallbackKind
+CallbackStatus
+CallbackSubscription
+CallbackDelivery
+CallbackAttempt
+CallbackPayload
+CallbackResult
+```
+
+### CallbackKind
+
+```text
+WEBHOOK
+IN_PROCESS
+MESSAGE_QUEUE
+```
+
+### CallbackStatus
+
+```text
+PENDING
+IN_FLIGHT
+DELIVERED
+RETRY_WAIT
+DEAD_LETTER
+CANCELLED
+DISABLED
+```
+
+### CallbackSubscription
+
+描述外部系统订阅了哪些事件。
+
+主要字段：
+
+```text
+subscription_id
+name
+callback_kind
+target
+event_types
+task_id
+conversation_id
+enabled
+secret_reference
+timeout_seconds
+max_attempts
+created_at
+```
+
+例如一个外部系统可以只订阅：
+
+```text
+TASK_COMPLETED
+TASK_FAILED
+ARTIFACT_CREATED
+```
+
+而不接收每一次模型或工具事件。
+
+### CallbackDelivery
+
+描述某一次事件通知任务：
+
+```text
+delivery_id
+subscription_id
+event_id
+status
+attempt_count
+next_attempt_at
+last_error
+created_at
+delivered_at
+```
+
+### CallbackAttempt
+
+记录每一次实际发送：
+
+```text
+attempt_number
+started_at
+finished_at
+http_status
+response_excerpt
+error
+duration_ms
+```
+
+---
+
+## 2. `event_callback/config.py`
+
+定义回调配置。
+
+例如：
+
+```text
+默认请求超时
+最大重试次数
+最大响应内容长度
+是否要求HTTPS
+允许访问的域名
+禁止访问的内网地址
+签名算法
+Worker轮询间隔
+```
+
+回调地址属于外部输入时，必须防止 SSRF。
+
+需要限制：
+
+```text
+127.0.0.1
+localhost
+169.254.169.254
+私有网段
+宿主机管理地址
+云实例元数据地址
+```
+
+除非明确配置为可信内部服务。
+
+---
+
+## 3. `event_callback/callback.py`
+
+定义统一 Callback 接口。
+
+所有回调实现遵循：
+
+```text
+send(delivery, event) → CallbackResult
+validate()
+kind
+```
+
+上层不直接依赖 HTTP 客户端或消息队列 SDK。
+
+---
+
+## 4. `event_callback/registry.py`
+
+管理不同 Callback Provider。
+
+例如：
+
+```text
+webhook      → WebhookCallback
+in_process   → InProcessCallback
+message_queue→ MessageQueueCallback
+```
+
+根据订阅的 `callback_kind` 找到具体实现。
+
+---
+
+## 5. `event_callback/service.py`
+
+Event Callback 的业务入口。
+
+负责：
+
+* 创建回调订阅；
+* 删除或禁用订阅；
+* 查询匹配指定事件的订阅；
+* 为事件创建 CallbackDelivery；
+* 防止重复创建投递任务；
+* 管理投递状态；
+* 处理手动重试；
+* 取消任务相关回调。
+
+其他模块不应直接操作 CallbackStore。
+
+---
+
+## 6. `event_callback/dispatcher.py`
+
+负责执行单次回调分发决策。
+
+流程：
+
+```text
+读取CallbackDelivery
+→ 获取原始Event
+→ 获取CallbackSubscription
+→ Registry选择Callback Provider
+→ 生成Payload
+→ 执行发送
+→ 返回CallbackResult
+```
+
+它只负责一次投递，不负责后台循环。
+
+---
+
+## 7. `event_callback/store.py`
+
+保存订阅、投递任务和尝试记录。
+
+建议接口：
+
+```text
+create_subscription
+get_subscription
+list_subscriptions
+disable_subscription
+
+enqueue_delivery
+claim_delivery
+mark_delivered
+mark_retry
+mark_dead_letter
+list_deliveries
+release_expired_leases
+```
+
+第一版可以使用 SQLite。
+
+生产环境可以使用 PostgreSQL。
+
+---
+
+## 8. `event_callback/signing.py`
+
+为 Webhook 请求生成签名。
+
+建议请求头：
+
+```text
+X-Cloud-Agent-Event-Id
+X-Cloud-Agent-Event-Type
+X-Cloud-Agent-Timestamp
+X-Cloud-Agent-Signature
+```
+
+签名可基于：
+
+```text
+timestamp + "." + raw_request_body
+```
+
+使用 HMAC-SHA256。
+
+外部系统可以通过共享密钥验证：
+
+* 请求确实来自平台；
+* 消息没有被篡改；
+* 时间戳没有过期。
+
+签名密钥不能：
+
+* 写进 Event；
+* 写进任务日志；
+* 发给 LLM；
+* 注入沙箱。
+
+---
+
+## 9. `event_callback/retry_policy.py`
+
+控制失败重试。
+
+推荐：
+
+```text
+指数退避
++
+随机抖动
+```
+
+例如：
+
+```text
+第1次失败：2秒后
+第2次失败：4秒后
+第3次失败：8秒后
+第4次失败：16秒后
+最大间隔：5分钟
+```
+
+一般可重试：
+
+```text
+网络超时
+连接失败
+HTTP 408
+HTTP 429
+HTTP 5xx
+```
+
+一般不可重试：
+
+```text
+HTTP 400
+HTTP 401
+HTTP 403
+HTTP 404
+请求配置无效
+目标地址不安全
+```
+
+具体策略可以配置。
+
+---
+
+## 10. `event_callback/worker.py`
+
+后台领取和执行 CallbackDelivery。
+
+流程：
+
+```text
+查询到期投递
+→ Claim并建立租约
+→ Dispatcher发送
+→ 成功标记DELIVERED
+→ 失败计算重试时间
+→ 达到次数进入DEAD_LETTER
+```
+
+Worker 崩溃后，租约到期的任务可以重新领取。
+
+第一版可使用：
+
+```text
+asyncio后台任务
++
+SQLite轮询
+```
+
+---
+
+## 11. `event_callback/errors.py`
+
+建议定义：
+
+```text
+EventCallbackError
+SubscriptionNotFoundError
+CallbackDeliveryError
+CallbackTimeoutError
+CallbackAuthenticationError
+CallbackTargetRejectedError
+CallbackRetryExhaustedError
+CallbackSerializationError
+```
+
+---
+
+# 六、Callback Provider
+
+## 1. `providers/webhook.py`
+
+通过 HTTP 向外部系统发送事件。
+
+负责：
+
+* 构造 JSON Payload；
+* 生成签名；
+* 设置请求头；
+* 设置连接和读取超时；
+* 发送请求；
+* 限制响应大小；
+* 返回 HTTP 状态和结果；
+* 防止自动重定向到危险地址。
+
+---
+
+## 2. `providers/in_process.py`
+
+用于进程内回调。
+
+例如：
+
+```text
+任务完成后更新内部指标
+任务失败后执行内部告警函数
+测试时记录收到的事件
+```
+
+它不经过网络，适合单机测试和内部扩展。
+
+但它不适合跨进程持久化通知。
+
+---
+
+## 3. `providers/message_queue.py`
+
+预留消息队列回调。
+
+未来可以将事件发送到：
+
+```text
+Kafka
+RabbitMQ
+Redis Streams
+AWS SNS/SQS
+Google Pub/Sub
+Azure Service Bus
+```
+
+第一版只保留接口，不需要实现。
+
+---
+
+# 七、Event Callback 工作流程
+
+## 1. 事件产生
+
+例如任务完成：
+
+```text
+TaskOrchestrator
+→ 创建TASK_COMPLETED Event
+```
+
+## 2. 保存事件
+
+```text
+EventStore.append(event)
+```
+
+## 3. 查找订阅
+
+```text
+EventCallbackService
+→ 查询订阅了TASK_COMPLETED的CallbackSubscription
+```
+
+## 4. 创建投递任务
+
+每个订阅生成一个独立：
+
+```text
+CallbackDelivery
+```
+
+例如：
+
+```text
+一个事件
+→ 业务系统Webhook
+→ 监控系统Webhook
+→ 内部统计Callback
+```
+
+会产生三个 Delivery。
+
+## 5. 异步发送
+
+```text
+CallbackWorker
+→ Dispatcher
+→ WebhookCallback
+→ 外部系统
+```
+
+任务主流程不等待外部 Webhook 完成。
+
+否则外部系统缓慢或故障会阻塞 Agent 任务。
+
+---
+
+# 八、Event Store、Pending Messages 与 Event Callback 的事务关系
+
+一个事件产生后，可能需要：
+
+1. 保存事件；
+2. 向前端发送消息；
+3. 向外部系统发送回调。
+
+推荐采用 Transactional Outbox 思想：
+
+```text
+同一数据库事务中：
+
+1. 保存Event
+2. 创建Outbound PendingMessage
+3. 创建CallbackDelivery
+4. 提交事务
+```
+
+然后由两个独立 Worker 分发：
+
+```text
+PendingMessageWorker
+    → 前端
+
+EventCallbackWorker
+    → 外部系统
+```
+
+这样即使服务在事务提交后立即崩溃，消息和回调任务仍然存在。
+
+---
+
+# 九、Event Callback Payload
+
+建议统一格式：
+
+```text
+event_id
+event_type
+task_id
+conversation_id
+sequence
+occurred_at
+source
+data
+artifact_refs
+```
+
+不要直接把大文件内容放进 Webhook。
+
+例如报告生成事件只返回：
+
+```text
+artifact_id
+file_name
+content_type
+size
+download_reference
+```
+
+外部系统再通过文件接口下载。
+
+---
+
+# 十、File Storage 模块
+
+## 1. `file_storage/models.py`
+
+建议定义：
+
+```text
+FileStoreKind
+FileRef
+FileMetadata
+FileObject
+FileWriteResult
+FileListPage
+```
+
+### FileRef
+
+其他模块引用文件时使用的轻量对象。
+
+字段：
+
+```text
+file_id
+key
+store_kind
+file_name
+content_type
+size
+checksum
+created_at
+```
+
+业务层不应长期保存真实本地绝对路径。
+
+例如不应该把：
+
+```text
+/tmp/cloud-agent-task-123/artifacts/report.md
+```
+
+作为最终结果返回。
+
+应该返回：
+
+```text
+tasks/123/artifacts/report.md
+```
+
+对应的 `FileRef`。
+
+---
+
+## 2. `file_storage/config.py`
+
+定义不同 FileStore 的配置。
+
+可以使用带 `kind` 字段的判别联合类型：
+
+```text
+LocalFileStoreConfig
+InMemoryFileStoreConfig
+S3FileStoreConfig
+GCSFileStoreConfig
+AzureBlobFileStoreConfig
+```
+
+例如：
+
+```yaml
+kind: local
+root_path: ./data/files
+```
+
+或：
+
+```yaml
+kind: s3
+bucket: cloud-agent-artifacts
+region: ap-southeast-1
+prefix: production
+```
+
+OpenHands 使用 `DiscriminatedUnionMixin` 根据 `kind` 完成自动序列化与反序列化。
+
+你的项目也可以采用这一思想，但建议使用稳定的显式值：
+
+```text
+local
+memory
+s3
+gcs
+azure_blob
+```
+
+而不是完全依赖 Python 类名。
+
+原因是类名一旦重构，历史配置可能失效。
+
+---
+
+## 3. `file_storage/base.py`
+
+定义统一 `FileStore` 接口。
+
+建议能力：
+
+```text
+put_bytes
+put_stream
+get_bytes
+open_reader
+exists
+stat
+delete
+list
+copy
+move
+generate_download_url
+```
+
+例如：
+
+```text
+put_bytes(key, data, metadata) → FileRef
+get_bytes(key) → bytes
+delete(key)
+exists(key) → bool
+```
+
+所有业务模块只依赖该接口。
+
+---
+
+## 4. `file_storage/registry.py`
+
+注册不同 FileStore 实现：
+
+```text
+local      → LocalFileStore
+memory     → InMemoryFileStore
+s3         → S3FileStore
+gcs        → GCSFileStore
+azure_blob → AzureBlobFileStore
+```
+
+---
+
+## 5. `file_storage/factory.py`
+
+根据配置创建实际 FileStore。
+
+流程：
+
+```text
+读取FileStoreConfig
+→ 查看kind
+→ Registry查找实现
+→ 创建FileStore
+```
+
+例如：
+
+```text
+开发环境
+kind=local
+
+单元测试
+kind=memory
+
+生产环境
+kind=s3
+```
+
+业务代码不需要修改。
+
+---
+
+## 6. `file_storage/path_policy.py`
+
+统一校验存储 Key。
+
+防止：
+
+```text
+../
+绝对路径
+空Key
+非法控制字符
+覆盖系统文件
+跨任务访问
+```
+
+推荐文件 Key：
+
+```text
+tasks/{task_id}/artifacts/{file_name}
+tasks/{task_id}/logs/{file_name}
+conversations/{conversation_id}/attachments/{file_name}
+```
+
+同一个用户不能通过构造 Key 访问其他任务的文件。
+
+---
+
+## 7. `file_storage/errors.py`
+
+建议定义：
+
+```text
+FileStoreError
+FileNotFoundError
+FileAlreadyExistsError
+InvalidFileKeyError
+FileTooLargeError
+FileStoreUnavailableError
+UnsupportedFileOperationError
+FileIntegrityError
+```
+
+---
+
+# 十一、File Storage Provider
+
+## 1. `providers/local.py`
+
+### LocalFileStore
+
+把文件保存到本地文件系统。
+
+适合：
+
+```text
+本地开发
+单机部署
+笔试演示
+小规模环境
+```
+
+需要处理：
+
+* 根目录限制；
+* 路径穿越；
+* 原子写入；
+* 自动创建父目录；
+* 文件覆盖策略；
+* 文件权限；
+* 校验值。
+
+不能让业务传入任意绝对路径。
+
+---
+
+## 2. `providers/memory.py`
+
+### InMemoryFileStore
+
+把文件内容保存在内存字典中。
+
+适合：
+
+```text
+单元测试
+Mock演示
+临时数据
+无需磁盘的快速测试
+```
+
+缺点：
+
+* 进程重启后数据丢失；
+* 不适合大文件；
+* 不适合多实例共享；
+* 不适合生产持久化。
+
+---
+
+## 3. `providers/s3.py`
+
+### S3FileStore
+
+支持：
+
+```text
+AWS S3
+MinIO
+Cloudflare R2
+其他S3兼容对象存储
+```
+
+负责：
+
+* 上传对象；
+* 下载对象；
+* 查询元数据；
+* 删除对象；
+* 分页列出对象；
+* 生成预签名下载 URL；
+* 可选服务端加密；
+* 大文件分片上传。
+
+适合分布式生产部署。
+
+---
+
+## 4. `providers/gcs.py`
+
+### GoogleCloudStorageFileStore
+
+负责接入 Google Cloud Storage。
+
+能力与 S3 类似：
+
+* 上传；
+* 下载；
+* 删除；
+* 元数据；
+* Signed URL；
+* Bucket 和 Prefix 管理。
+
+---
+
+## 5. `providers/azure_blob.py`
+
+### AzureBlobFileStore
+
+负责接入 Azure Blob Storage。
+
+支持：
+
+* Container；
+* Blob 上传下载；
+* SAS URL；
+* 元数据；
+* 删除和列表。
+
+---
+
+# 十二、File Storage 的使用位置
+
+## 1. Agent 任务产物
+
+沙箱中先生成：
+
+```text
+/workspace/artifacts/report.md
+```
+
+任务结束后：
+
+```text
+TaskOrchestrator
+→ 读取本地临时产物
+→ FileStore.put_stream
+→ 获得FileRef
+→ 保存到TaskResult
+```
+
+---
+
+## 2. 日志文件
+
+较大的执行日志不应全部写进 EventStore。
+
+应：
+
+```text
+日志文件
+→ FileStore
+→ Event中保存FileRef
+```
+
+---
+
+## 3. 用户上传文件
+
+用户上传压缩包或补充资料时：
+
+```text
+API
+→ FileStore
+→ FileRef
+→ WorkspaceManager下载到任务目录
+```
+
+---
+
+## 4. Pending Messages
+
+对话消息中不应嵌入大型文件。
+
+应该发送：
+
+```text
+artifact_id
+file_name
+size
+content_type
+```
+
+前端再通过 Artifact API 下载。
+
+---
+
+## 5. Event Callback
+
+Webhook 中也不发送大文件正文。
+
+只发送：
+
+```text
+FileRef
+```
+
+或短期下载 URL。
+
+---
+
+# 十三、File Storage 与 Workspace 的关系
+
+FileStore 不能直接取代本地 Workspace。
+
+Docker 沙箱通常需要真实的本地目录挂载：
+
+```text
+宿主机任务目录
+→ Docker /workspace
+```
+
+因此流程是：
+
+## 任务开始前
+
+```text
+FileStore中的输入文件
+→ 下载到本地Workspace
+→ 挂载到Sandbox
+```
+
+## 任务执行时
+
+```text
+Sandbox
+→ 读写本地任务目录
+```
+
+## 任务完成后
+
+```text
+本地Artifacts
+→ 上传到FileStore
+→ 清理本地Workspace
+```
+
+因此：
+
+```text
+Workspace
+负责任务执行时的临时本地文件
+
+FileStore
+负责任务完成后的持久化文件
+```
+
+---
+
+# 十四、Artifact API
+
+## `api/artifact_api.py`
+
+负责文件上传和下载。
+
+可以提供：
+
+```text
+GET    /tasks/{task_id}/artifacts
+GET    /files/{file_id}
+POST   /conversations/{conversation_id}/attachments
+DELETE /files/{file_id}
+```
+
+根据 FileStore 能力：
+
+* LocalFileStore：由应用读取并返回文件；
+* S3FileStore：可以返回短期预签名 URL；
+* GCS：返回 Signed URL；
+* Azure：返回 SAS URL。
+
+必须检查用户是否有权访问该 Task 或 Conversation。
+
+---
+
+# 十五、Callback API
+
+## `api/callback_api.py`
+
+负责管理外部回调订阅。
+
+可以提供：
+
+```text
+POST   /callbacks
+GET    /callbacks
+GET    /callbacks/{subscription_id}
+PATCH  /callbacks/{subscription_id}
+DELETE /callbacks/{subscription_id}
+
+GET    /callbacks/{subscription_id}/deliveries
+POST   /callback-deliveries/{delivery_id}/retry
+```
+
+需要进行权限检查。
+
+普通用户不应任意创建指向内网的 Webhook。
+
+---
+
+# 十六、加入两个模块后的完整事件流程
+
+以 Agent 完成报告为例：
+
+```text
+Agent生成report.md
+        ↓
+Sandbox本地产物目录
+        ↓
+TodoReportVerifier验证
+        ↓
+FileStore保存报告
+        ↓
+生成FileRef
+        ↓
+TaskOrchestrator创建ARTIFACT_CREATED Event
+        ↓
+同一事务中：
+├── EventStore保存Event
+├── 创建Outbound PendingMessage
+└── 创建CallbackDelivery
+        ↓
+两个后台Worker独立处理
+```
+
+前端路径：
+
+```text
+PendingMessageWorker
+→ WebSocket
+→ 前端收到报告信息
+→ ACK
+```
+
+外部系统路径：
+
+```text
+EventCallbackWorker
+→ 签名Webhook
+→ 外部业务系统
+→ HTTP成功响应
+→ 标记DELIVERED
+```
+
+文件下载路径：
+
+```text
+前端或外部系统
+→ Artifact API
+→ FileStore
+→ 下载报告
+```
+
+---
+
+# 十七、系统启动流程调整
+
+`main.py` 启动时需要新增：
+
+```text
+加载FileStore配置
+→ FileStoreFactory创建后端
+→ 创建EventCallbackStore
+→ 注册Callback Provider
+→ 创建EventCallbackService
+→ 启动EventCallbackWorker
+```
+
+完整流程：
+
+```text
+加载Settings
+→ 创建TaskStore
+→ 创建EventStore
+→ 创建PendingMessageStore
+→ 创建FileStore
+→ 创建EventCallbackStore
+→ 创建SandboxService
+→ 注册LLM Provider
+→ 注册Tools
+→ 初始化MCP
+→ 创建AgentRunner
+→ 创建Verifier
+→ 创建TaskOrchestrator
+→ 启动PendingMessageWorker
+→ 启动EventCallbackWorker
+→ 启动API
+```
+
+---
+
+# 十八、配置文件调整
+
+`settings.py` 需要增加：
+
+```text
+FILE_STORE_KIND
+LOCAL_FILE_STORE_ROOT
+
+S3_BUCKET
+S3_REGION
+S3_ENDPOINT
+S3_ACCESS_KEY
+S3_SECRET_KEY
+
+GCS_BUCKET
+GCS_CREDENTIALS
+
+AZURE_STORAGE_ACCOUNT
+AZURE_STORAGE_CONTAINER
+
+CALLBACK_DEFAULT_TIMEOUT
+CALLBACK_MAX_ATTEMPTS
+CALLBACK_REQUIRE_HTTPS
+CALLBACK_ALLOWED_HOSTS
+CALLBACK_SIGNING_SECRET
+CALLBACK_WORKER_INTERVAL
+```
+
+云存储密钥和 Callback Secret：
+
+* 不进入 LLM；
+* 不进入 Sandbox；
+* 不写日志；
+* 不发送给前端；
+* 不保存到 Event Payload。
+
+---
+
+# 十九、第一版建议实现范围
+
+## Event Callback 第一版
+
+真正实现：
+
+```text
+event_callback/models.py
+event_callback/callback.py
+event_callback/store.py
+event_callback/service.py
+event_callback/dispatcher.py
+event_callback/signing.py
+event_callback/retry_policy.py
+event_callback/worker.py
+event_callback/providers/webhook.py
+event_callback/providers/in_process.py
+```
+
+技术方案：
+
+```text
+SQLite保存订阅与投递记录
+HTTP Webhook
+HMAC-SHA256签名
+指数退避
+最大重试次数
+死信状态
+asyncio后台Worker
+```
+
+暂不实现：
+
+```text
+Kafka
+RabbitMQ
+SNS/SQS
+Google Pub/Sub
+复杂OAuth
+多地域投递
+```
+
+---
+
+## File Storage 第一版
+
+真正实现：
+
+```text
+file_storage/models.py
+file_storage/config.py
+file_storage/base.py
+file_storage/registry.py
+file_storage/factory.py
+file_storage/path_policy.py
+file_storage/providers/local.py
+file_storage/providers/memory.py
+```
+
+只保留接口：
+
+```text
+file_storage/providers/s3.py
+file_storage/providers/gcs.py
+file_storage/providers/azure_blob.py
+```
+
+这样既能展示存储后端可替换，又不会让笔试代码范围过大。
+
+---
+
+# 二十、需要增加的测试
+
+## Event Callback
+
+```text
+test_callback_subscription.py
+test_callback_event_filter.py
+test_webhook_signing.py
+test_webhook_retry.py
+test_callback_dead_letter.py
+test_callback_ssrf_policy.py
+```
+
+重点场景：
+
+```text
+事件类型匹配
+同一事件通知多个订阅
+Webhook超时
+HTTP 500重试
+HTTP 400不重试
+签名验证
+重复Delivery幂等
+Worker崩溃后恢复
+```
+
+---
+
+## File Storage
+
+```text
+test_local_file_store.py
+test_memory_file_store.py
+test_file_store_factory.py
+test_file_key_policy.py
+test_file_integrity.py
+```
+
+重点场景：
+
+```text
+保存和读取文件
+删除文件
+文件不存在
+路径穿越
+不同后端行为一致
+文件校验值
+Local和Memory配置自动创建
+```
+
+---
+
+# 二十一、更新后的模块边界
+
+```text
+EventStore
+记录业务事实
+
+PendingMessages
+向前端可靠投递消息
+
+EventCallback
+向外部系统可靠投递事件
+
+FileStore
+保存文件和任务产物
+
+WorkspaceManager
+管理沙箱运行期间的临时本地目录
+
+TaskStore
+保存任务元数据
+
+SandboxService
+管理隔离执行环境
+```
+
+它们之间不能相互替代。
+
+---
+
+# 二十二、最终完整工作流程
+
+```text
+用户提交任务
+        ↓
+Task API创建Task和Conversation
+        ↓
+用户消息进入PendingMessageStore
+        ↓
+WorkspaceManager创建目录
+        ↓
+RepositoryPreparer拉取GitHub仓库
+        ↓
+DockerSandboxService创建沙箱
+        ↓
+沙箱进入RUNNING
+        ↓
+释放等待中的入站消息
+        ↓
+AgentRunner调用ModelProvider
+        ↓
+模型产生ToolCall
+        ↓
+ToolPolicy检查
+        ↓
+Native工具进入Sandbox
+或MCP工具进入MCP Server
+        ↓
+工具结果返回Agent
+        ↓
+Agent生成报告
+        ↓
+Verifier独立验证
+        ↓
+报告上传FileStore
+        ↓
+生成FileRef
+        ↓
+保存任务完成Event
+        ↓
+创建前端PendingMessage
+        ↓
+创建外部CallbackDelivery
+        ↓
+前端在线则实时发送，离线则重连补发
+        ↓
+外部系统通过Webhook接收通知
+        ↓
+删除Sandbox
+        ↓
+清理本地Workspace
+        ↓
+长期保留Task、Event、FileRef和必要投递记录
+```
+
+---
+
+# 二十三、加入后的核心能力总结
+
+完整平台现在具有八项核心能力：
+
+```text
+1. Task Orchestrator
+   管理任务生命周期
+
+2. Agent Runner
+   管理模型与工具循环
+
+3. LLM Provider
+   支持多厂商和多模型
+
+4. Tool System
+   支持原生工具和MCP工具
+
+5. Sandbox Service
+   提供隔离执行
+
+6. Pending Messages
+   为前端对话提供持久化、排序、ACK和断线补发
+
+7. Event Callback
+   为外部系统提供Webhook、签名、重试和死信
+
+8. File Storage
+   为报告和文件提供可替换的本地、内存及云存储后端
+```
+
+最重要的数据流是：
+
+```text
+业务事实进入EventStore
+对话消息进入PendingMessages
+外部通知进入EventCallback
+文件内容进入FileStore
+```
+
+这样可以避免事件、消息、回调投递状态和文件内容全部混在同一套存储逻辑中。
