@@ -7,6 +7,8 @@ Cloud Agent Platform 是一个面向代码仓库和综合任务的云端 Agent �
 The platform is designed for coding, repository analysis, report generation, code review, build/test automation, and mixed multi-step tasks.
 
 
+For the exam-oriented architecture write-up and diagrams, see `docs/submission.md`.
+
 For local setup, testing, API usage, Docker sandbox usage, and GitHub publishing steps, see `docs/operation-flow.md`.
 
 ## Current Focus
