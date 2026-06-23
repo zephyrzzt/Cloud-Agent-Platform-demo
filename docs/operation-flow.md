@@ -7,8 +7,8 @@ This document describes the end-to-end local workflow for testing and using the 
 Clone your GitHub repository and enter the project directory:
 
 ```powershell
-git clone https://github.com/your-name/your-repo.git
-cd your-repo
+git clone https://github.com/zephyrzzt/Cloud-Agent-Platform-demo.git
+cd Cloud-Agent-Platform-demo
 ```
 
 Install dependencies:
@@ -350,7 +350,7 @@ python -m pytest tests\test_verification.py -q
 Check whether this directory is already a Git repository:
 
 ```powershell
-cd your-repo
+cd Cloud-Agent-Platform-demo
 git status
 ```
 
@@ -372,7 +372,7 @@ Then create an empty GitHub repository and connect it:
 
 ```powershell
 git branch -M main
-git remote add origin https://github.com/your-name/your-repo.git
+git remote add origin https://github.com/zephyrzzt/Cloud-Agent-Platform-demo.git
 git push -u origin main
 ```
 
